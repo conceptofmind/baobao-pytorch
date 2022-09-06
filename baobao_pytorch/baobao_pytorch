@@ -6,6 +6,7 @@ from einops import rearrange
 from flash_cosine_sim_attention import flash_cosine_sim_attention
 
 
+
 class GEGLU(nn.Module):
     def forward(self, x):
         x, gate = x.chunk(2, dim=-1)
@@ -102,23 +103,55 @@ class Transformer(nn.Module):
 
 class BaoBao(nn.Module):
     def __init__(
-        self, 
-        dim, 
+        self,
+        num_tokens, 
+        dim,
+        max_seq_len, 
         depth, 
         dim_head = 64, 
         heads = 8, 
         scale = 8,
         ff_mult=4,
-        dropout=0., 
+        dropout=0.,
+        alpha = 0.1, 
         **kwargs
     ):
         super().__init__()
+
+        self.alpha = alpha
+
+        self.token_emb = nn.Embedding(num_tokens, dim)
+        self.pos_emb = nn.Embedding(max_seq_len, dim)
         self.transformer = Transformer(dim, depth, dim_head, heads, scale, ff_mult, dropout, **kwargs)
+        self.to_logits = nn.Linear(dim, num_tokens, bias = False)
+
+        self.token_emb.weight = self.to_logits.weight
+        nn.init.normal_(self.token_emb.weight, std=0.02)
+        nn.init.normal_(self.pos_emb.weight, std=0.02)
 
     def forward(self, x):
-        return self.transformer(x)
+
+        x = self.token_emb(x) * self.alpha + self.token_emb(x).detach() * (1 - self.alpha)
+        x += self.pos_emb(torch.arange(x.shape[1], device=x.device))
+        x = self.transformer(x)
+        return self.to_logits(x)
+
 
 if __name__ == '__main__':
-    model = BaoBao(512, 6).cuda()
-    x = torch.randn(1, 256, 512).cuda()
+
+    model = BaoBao(
+        num_tokens = 20000,
+        dim = 256,
+        max_seq_len = 512, 
+        depth = 6,
+    ).cuda()
+
+    x = torch.randint(0, 20000, (1, 512)).cuda()
+
     print(model(x).shape)
+
+    n_params_torch = sum(
+        p.numel() for p in model.parameters() if p.requires_grad
+    )
+
+    print(f"Number of parameters in torch model: {n_params_torch}")
