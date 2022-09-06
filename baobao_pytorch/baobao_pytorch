@@ -1,0 +1,124 @@
+import torch
+from torch import nn
+from torch.nn import functional as F
+from functools import partial
+from einops import rearrange
+from flash_cosine_sim_attention import flash_cosine_sim_attention
+
+
+class GEGLU(nn.Module):
+    def forward(self, x):
+        x, gate = x.chunk(2, dim=-1)
+        return x * F.gelu(gate)
+
+class FeedForward(nn.Module):
+    def __init__(self, dim, ff_mult=4, dropout=0.):
+        super().__init__()
+        ff_inner_dim = int(dim * ff_mult)
+        self.net = nn.Sequential(
+            nn.Linear(dim, ff_inner_dim * 2, bias = False),
+            GEGLU(),
+            nn.Dropout(dropout),
+            nn.Linear(ff_inner_dim, dim, bias = False)
+        )
+    def forward(self, x):
+        return self.net(x)
+
+class Attention(nn.Module):
+    def __init__(
+        self,
+        dim,
+        dim_head = 64,
+        heads = 8,
+        scale = 8,
+        **kwargs
+    ):
+        super().__init__()
+        inner_dim = dim_head * heads
+        self.scale = scale
+        self.heads = heads
+
+        self.attn_fn = partial(flash_cosine_sim_attention, **kwargs)
+
+        self.to_q = nn.Linear(dim, inner_dim, bias = False)
+        self.to_k = nn.Linear(dim, inner_dim, bias = False)
+        self.to_v = nn.Linear(dim, inner_dim, bias = False)
+        self.to_out = nn.Linear(inner_dim, dim, bias = False)
+
+    def forward(self, x):
+        h, scale = self.heads, self.scale
+
+        q, k, v = self.to_q(x), self.to_k(x), self.to_v(x)
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k, v))
+
+        o = self.attn_fn(q, k, v, causal = True, scale = scale)
+
+        o = rearrange(o, 'b h n d -> b n (h d)')
+        return self.to_out(o)
+
+class ParallelAttention(nn.Module):
+    def __init__(
+        self, 
+        dim, 
+        dim_head = 64, 
+        heads = 8, 
+        scale = 8,
+        ff_mult=4,
+        dropout=0., 
+        **kwargs
+    ):
+        super().__init__()
+        self.attention = Attention(dim, dim_head, heads, scale, **kwargs)
+        self.ffn = FeedForward(dim, ff_mult, dropout)
+
+    def forward(self, x):
+        return self.attention(x) + self.ffn(x)
+
+class Transformer(nn.Module):
+    def __init__(
+        self, 
+        dim, 
+        depth, 
+        dim_head = 64, 
+        heads = 8, 
+        scale = 8,
+        ff_mult=4,
+        dropout=0., 
+        **kwargs
+    ):
+        super().__init__()
+        self.layers = nn.ModuleList([])
+        for _ in range(depth):
+            self.layers.append(nn.ModuleList([
+                ParallelAttention(dim, dim_head, heads, scale, ff_mult, dropout, **kwargs),
+                nn.LayerNorm(dim)
+            ]))
+
+    def forward(self, x):
+        for attention, norm in self.layers:
+            x = attention(x) + x
+            x = norm(x)
+        return x
+
+class BaoBao(nn.Module):
+    def __init__(
+        self, 
+        dim, 
+        depth, 
+        dim_head = 64, 
+        heads = 8, 
+        scale = 8,
+        ff_mult=4,
+        dropout=0., 
+        **kwargs
+    ):
+        super().__init__()
+        self.transformer = Transformer(dim, depth, dim_head, heads, scale, ff_mult, dropout, **kwargs)
+
+    def forward(self, x):
+        return self.transformer(x)
+
+if __name__ == '__main__':
+    model = BaoBao(512, 6).cuda()
+    x = torch.randn(1, 256, 512).cuda()
+    print(model(x).shape)
