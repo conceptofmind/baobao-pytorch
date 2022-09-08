@@ -5,6 +5,18 @@ from functools import partial
 from einops import rearrange
 from flash_cosine_sim_attention import flash_cosine_sim_attention
 
+# normalization
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps = 1e-8):
+        super().__init__()
+        self.scale = dim ** -0.5
+        self.eps = eps
+        self.g = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        norm = torch.norm(x, dim = -1, keepdim = True) * self.scale
+        return x / norm.clamp(min = self.eps) * self.g
 
 
 class GEGLU(nn.Module):
@@ -92,7 +104,7 @@ class Transformer(nn.Module):
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
                 ParallelAttention(dim, dim_head, heads, scale, ff_mult, dropout, **kwargs),
-                nn.LayerNorm(dim)
+                RMSNorm(dim)
             ]))
 
     def forward(self, x):
